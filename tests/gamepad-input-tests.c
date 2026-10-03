@@ -140,7 +140,7 @@ static void edges(bool snappy) {
     for (unsigned i = 0; i < sentCount; i++) {
         int buttons = (uint16_t)LE16(sent[i].packet.buttonFlags) | ((uint32_t)(uint16_t)LE16(sent[i].packet.buttonFlags2) << 16);
         CHECK(buttons == sequence[i]);
-        CHECK(LE16(sent[i].packet.leftStickX) == i * 10 + 1);
+        CHECK(LE16(sent[i].packet.leftStickX) == (short)(i * 10 + 1));
         CHECK(sent[i].flags & ENET_PACKET_FLAG_RELIABLE);
         CHECK(sent[i].moreData == (!snappy && i + 1 < sentCount));
     }
