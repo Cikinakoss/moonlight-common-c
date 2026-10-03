@@ -1,0 +1,24 @@
+name: Gamepad input tests
+on:
+  push:
+    branches: [snappy-gamepad-input]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  input:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Test real gamepad queue and worker with AddressSanitizer
+        run: |
+          clang -std=gnu11 -g -O1 -Wall -Wextra -Wno-unused-parameter -Werror \
+            -DLC_DEBUG -fsanitize=address,undefined -pthread -I src -I enet/include \
+            tests/gamepad-input-tests.c src/Platform.c src/LinkedBlockingQueue.c \
+            -o "$RUNNER_TEMP/gamepad-tests"
+          "$RUNNER_TEMP/gamepad-tests"

@@ -766,6 +766,22 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
     int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
     short leftStickX, short leftStickY, short rightStickX, short rightStickY);
 
+// Fork-only experiment. Configure while the connection is stopped; default false.
+// Applies send-now hints only to LiSendPhysicalGamepadEvent() packets and raises
+// InputSend QoS on Apple platforms. Ordinary controller/mouse/touch APIs are unchanged.
+void LiSetSnappyGamepadInput(bool enabled);
+
+// Record entry to a GCController callback and return a LiGetMicroseconds() timestamp.
+// Returns 0 outside an active input stream. Diagnostics are logged in both modes.
+uint64_t LiRecordGamepadCallback(void);
+
+// Physical gamepads only. eventTimeUs is callback entry time (0 uses current time).
+// Uses stock coalescing/edge semantics, with lifecycle serialization on Windows/POSIX.
+int LiSendPhysicalGamepadEvent(short controllerNumber, short activeGamepadMask,
+    int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
+    short leftStickX, short leftStickY, short rightStickX, short rightStickY,
+    uint64_t eventTimeUs);
+
 // This function provides a method of informing the host of the available buttons and capabilities
 // on a new controller. This is the recommended approach for indicating the arrival of a new controller.
 //

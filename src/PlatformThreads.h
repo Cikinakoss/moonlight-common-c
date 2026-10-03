@@ -7,6 +7,7 @@ typedef void(*ThreadEntry)(void* context);
 
 #if defined(LC_WINDOWS)
 typedef SRWLOCK PLT_MUTEX;
+#define PLT_MUTEX_INITIALIZER SRWLOCK_INIT
 typedef CONDITION_VARIABLE PLT_COND;
 typedef struct _PLT_THREAD {
     HANDLE handle;
@@ -28,6 +29,7 @@ typedef struct _PLT_THREAD {
 } PLT_THREAD;
 #elif defined (LC_POSIX)
 typedef pthread_mutex_t PLT_MUTEX;
+#define PLT_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
 typedef pthread_cond_t PLT_COND;
 typedef struct _PLT_THREAD {
     pthread_t thread;

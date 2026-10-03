@@ -1,4 +1,14 @@
 #include "Limelight-internal.h"
+#ifdef LC_DARWIN
+#include <pthread/qos.h>
+#endif
+
+static bool snappyGamepadInput;
+static bool acceptingPhysicalGamepadEvents;
+#ifdef PLT_MUTEX_INITIALIZER
+// Lives across connections so late physical callbacks never lock a destroyed mutex.
+static PLT_MUTEX gamepadLifecycleMutex = PLT_MUTEX_INITIALIZER;
+#endif
 
 static SOCKET inputSock = INVALID_SOCKET;
 static unsigned char currentAesIv[16];
@@ -52,6 +62,12 @@ typedef struct _PACKET_HOLDER {
     uint32_t enetPacketFlags;
     uint8_t channelId;
 
+    uint64_t gamepadFirstEventUs;
+    uint64_t gamepadLatestEventUs;
+    uint64_t gamepadQueuedUs;
+    uint64_t gamepadClaimedUs;
+    bool snappyGamepad;
+
     // The union must be the last member since we abuse the NV_UNICODE_PACKET
     // text field to store variable length data which gets split before being
     // sent to the host.
@@ -78,6 +94,69 @@ typedef struct _PACKET_HOLDER {
 
 static PLT_MUTEX batchedInputMutex;
 static PPACKET_HOLDER currentQueuedControllerPacket[MAX_GAMEPADS];
+static struct {
+    uint64_t windowStartUs;
+    uint64_t callbacks, created, coalesced, sent, digitalEdges, dequeues, sendNow;
+    uint64_t queueAgeSumUs, queueAgeMaxUs, sendAgeSumUs, sendAgeMaxUs;
+    uint64_t oldestAgeSumUs, returnAgeSumUs;
+    uint64_t histogram[64]; // 250 us buckets; last bucket includes >=15.75 ms.
+    unsigned pending, highWater;
+} gamepadDiagnostics;
+
+static uint64_t gamepadAge(uint64_t now, uint64_t then) {
+    return now >= then ? now - then : 0;
+}
+
+// Called only by InputSend after a successful physical packet send. No log I/O
+// while holding the batching mutex. Counts are interval totals, not OS wake counts.
+static void logGamepadDiagnostics(PPACKET_HOLDER holder, uint64_t sendUs, uint64_t returnUs, bool sendNow) {
+    PltLockMutex(&batchedInputMutex);
+    uint64_t queueAge = gamepadAge(holder->gamepadClaimedUs, holder->gamepadLatestEventUs);
+    uint64_t sendAge = gamepadAge(sendUs, holder->gamepadLatestEventUs);
+    gamepadDiagnostics.sent++;
+    gamepadDiagnostics.sendNow += sendNow;
+    gamepadDiagnostics.queueAgeSumUs += queueAge;
+    gamepadDiagnostics.queueAgeMaxUs = queueAge > gamepadDiagnostics.queueAgeMaxUs ? queueAge : gamepadDiagnostics.queueAgeMaxUs;
+    gamepadDiagnostics.sendAgeSumUs += sendAge;
+    gamepadDiagnostics.sendAgeMaxUs = sendAge > gamepadDiagnostics.sendAgeMaxUs ? sendAge : gamepadDiagnostics.sendAgeMaxUs;
+    gamepadDiagnostics.oldestAgeSumUs += gamepadAge(sendUs, holder->gamepadFirstEventUs);
+    gamepadDiagnostics.returnAgeSumUs += gamepadAge(returnUs, holder->gamepadLatestEventUs);
+    gamepadDiagnostics.histogram[queueAge / 250 < 63 ? queueAge / 250 : 63]++;
+    if (returnUs - gamepadDiagnostics.windowStartUs < 1000000) {
+        PltUnlockMutex(&batchedInputMutex);
+        return;
+    }
+    uint64_t target = (gamepadDiagnostics.sent * 95 + 99) / 100;
+    uint64_t cumulative = 0;
+    unsigned bucket = 0;
+    for (; bucket < 63; bucket++) {
+        cumulative += gamepadDiagnostics.histogram[bucket];
+        if (cumulative >= target) break;
+    }
+    double seconds = (returnUs - gamepadDiagnostics.windowStartUs) / 1000000.0;
+    double n = (double)gamepadDiagnostics.sent;
+    char line[768];
+    snprintf(line, sizeof(line),
+        "Gamepad client %s (%.2fs): callbacks=%llu created=%llu coalesced=%llu sent=%llu edges=%llu "
+        "dequeue-wakes=%llu pending=%u high-water=%u send-now=%llu; "
+        "queue ms avg=%.3f p95%s=%.3f max=%.3f; send ms avg=%.3f max=%.3f; "
+        "oldest-event/send avg=%.3f send-return avg=%.3f\n",
+        snappyGamepadInput ? "ON" : "OFF", seconds,
+        (unsigned long long)gamepadDiagnostics.callbacks, (unsigned long long)gamepadDiagnostics.created,
+        (unsigned long long)gamepadDiagnostics.coalesced, (unsigned long long)gamepadDiagnostics.sent,
+        (unsigned long long)gamepadDiagnostics.digitalEdges, (unsigned long long)gamepadDiagnostics.dequeues,
+        gamepadDiagnostics.pending, gamepadDiagnostics.highWater, (unsigned long long)gamepadDiagnostics.sendNow,
+        gamepadDiagnostics.queueAgeSumUs / n / 1000.0, bucket == 63 ? ">=" : "<=",
+        (bucket == 63 ? 63 : bucket + 1) * 0.25, gamepadDiagnostics.queueAgeMaxUs / 1000.0,
+        gamepadDiagnostics.sendAgeSumUs / n / 1000.0, gamepadDiagnostics.sendAgeMaxUs / 1000.0,
+        gamepadDiagnostics.oldestAgeSumUs / n / 1000.0, gamepadDiagnostics.returnAgeSumUs / n / 1000.0);
+    unsigned pending = gamepadDiagnostics.pending;
+    memset(&gamepadDiagnostics, 0, sizeof(gamepadDiagnostics));
+    gamepadDiagnostics.windowStartUs = returnUs;
+    gamepadDiagnostics.pending = gamepadDiagnostics.highWater = pending;
+    PltUnlockMutex(&batchedInputMutex);
+    Limelog("%s", line);
+}
 static struct {
     float x, y, z;
     bool dirty; // Update ready to send (queued packet holder in packetQueue)
@@ -119,6 +198,9 @@ int initializeInputStream(void) {
     absCurrentPosX = absCurrentPosY = 0.5f;
 
     memset(currentGamepadSensorState, 0, sizeof(currentGamepadSensorState));
+    memset(currentQueuedControllerPacket, 0, sizeof(currentQueuedControllerPacket));
+    memset(&gamepadDiagnostics, 0, sizeof(gamepadDiagnostics));
+    gamepadDiagnostics.windowStartUs = PltGetMicroseconds();
     memset(&currentRelativeMouseState, 0, sizeof(currentRelativeMouseState));
     memset(&currentAbsoluteMouseState, 0, sizeof(currentAbsoluteMouseState));
     PltCreateMutex(&batchedInputMutex);
@@ -129,6 +211,8 @@ int initializeInputStream(void) {
 // Destroys and cleans up the input stream
 void destroyInputStream(void) {
     PLINKED_BLOCKING_QUEUE_ENTRY entry, nextEntry;
+
+    memset(currentQueuedControllerPacket, 0, sizeof(currentQueuedControllerPacket));
 
     PltDestroyCryptoContext(cryptoContext);
 
@@ -201,7 +285,7 @@ static void freePacketHolder(PPACKET_HOLDER holder) {
     }
 }
 
-static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
+static PPACKET_HOLDER allocatePacketHolderRaw(int extraLength) {
     PPACKET_HOLDER holder;
     int err;
 
@@ -230,6 +314,16 @@ static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
         // Otherwise we'll have to allocate
         return malloc(sizeof(*holder));
     }
+}
+
+static PPACKET_HOLDER allocatePacketHolder(int extraLength) {
+    PPACKET_HOLDER holder = allocatePacketHolderRaw(extraLength);
+    if (holder) {
+        holder->gamepadFirstEventUs = holder->gamepadLatestEventUs = 0;
+        holder->gamepadQueuedUs = holder->gamepadClaimedUs = 0;
+        holder->snappyGamepad = false;
+    }
+    return holder;
 }
 
 static bool sendInputPacket(PPACKET_HOLDER holder, bool moreData) {
@@ -319,12 +413,33 @@ static void floatToNetfloat(float in, netfloat out) {
     }
 }
 
+static void latchControllerPacket(PPACKET_HOLDER holder, short controllerNumber) {
+    PltLockMutex(&batchedInputMutex);
+    // An edge may have sealed this packet and published a later pending holder.
+    if (holder == currentQueuedControllerPacket[controllerNumber]) {
+        currentQueuedControllerPacket[controllerNumber] = NULL;
+    }
+    if (holder->gamepadFirstEventUs) {
+        holder->gamepadClaimedUs = PltGetMicroseconds();
+        gamepadDiagnostics.dequeues++;
+        gamepadDiagnostics.pending--;
+    }
+    PltUnlockMutex(&batchedInputMutex);
+}
+
 // Input thread proc
 static void inputSendThreadProc(void* context) {
     SOCK_RET err;
     PPACKET_HOLDER holder;
     uint32_t multiControllerMagicLE;
     uint32_t relMouseMagicLE;
+
+#ifdef LC_DARWIN
+    if (snappyGamepadInput) {
+        int qosError = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        Limelog("Snappy gamepad InputSend: USER_INTERACTIVE QoS result=%d\n", qosError);
+    }
+#endif
 
     if (AppVersionQuad[0] >= 5) {
         multiControllerMagicLE = LE32(MULTI_CONTROLLER_MAGIC_GEN5);
@@ -347,20 +462,12 @@ static void inputSendThreadProc(void* context) {
         // If it's a multi-controller packet, latch it by clearing currentQueuedControllerPacket.
         // This will prevent another thread from batching additional data into it while we're
         // trying to send it.
-        if (holder->packet.header.magic == multiControllerMagicLE) {
-            short controllerNumber = LE16(holder->packet.multiController.controllerNumber);
+        if (holder->packet.header.magic == multiControllerMagicLE ||
+            holder->packet.header.magic == LE32(CONTROLLER_MAGIC)) {
+            short controllerNumber = holder->packet.header.magic == multiControllerMagicLE ?
+                LE16(holder->packet.multiController.controllerNumber) : 0;
 
-            PltLockMutex(&batchedInputMutex);
-
-            // It's possible that the enqueuing code already moved on to batching into a new
-            // packet because something (like a button change) forced it to end the batch.
-            // We only need to stop batching into the current packet we're sending here, so
-            // it's fine if the input code continues to update a later packet concurrently.
-            if (holder == currentQueuedControllerPacket[controllerNumber]) {
-                currentQueuedControllerPacket[controllerNumber] = NULL;
-            }
-
-            PltUnlockMutex(&batchedInputMutex);
+            latchControllerPacket(holder, controllerNumber);
         }
         // If it's a relative mouse move packet, we can do batching
         else if (holder->packet.header.magic == relMouseMagicLE) {
@@ -605,10 +712,28 @@ static void inputSendThreadProc(void* context) {
             continue;
         }
 
-        // Encrypt and send the input packet
-        if (!sendInputPacket(holder, LbqGetItemCount(&packetQueue) > 0)) {
+        // Snappy physical state uses the existing send-now hint. Other input keeps
+        // stock hints and batching, including the 1 ms mouse/pen batching waits.
+#ifdef PLT_MUTEX_INITIALIZER
+        bool discardGamepad = false;
+        if (holder->snappyGamepad) {
+            PltLockMutex(&gamepadLifecycleMutex);
+            discardGamepad = !acceptingPhysicalGamepadEvents;
+            PltUnlockMutex(&gamepadLifecycleMutex);
+        }
+        if (discardGamepad) {
+            freePacketHolder(holder);
+            continue;
+        }
+#endif
+        bool moreData = !holder->snappyGamepad && LbqGetItemCount(&packetQueue) > 0;
+        uint64_t sendUs = holder->gamepadFirstEventUs ? PltGetMicroseconds() : 0;
+        if (!sendInputPacket(holder, moreData)) {
             freePacketHolder(holder);
             return;
+        }
+        if (holder->gamepadFirstEventUs) {
+            logGamepadDiagnostics(holder, sendUs, PltGetMicroseconds(), !moreData);
         }
 
         freePacketHolder(holder);
@@ -672,7 +797,14 @@ int startInputStream(void) {
     }
 
     // Allow input packets to be queued now
+#ifdef PLT_MUTEX_INITIALIZER
+    PltLockMutex(&gamepadLifecycleMutex);
+#endif
     initialized = true;
+    acceptingPhysicalGamepadEvents = true;
+#ifdef PLT_MUTEX_INITIALIZER
+    PltUnlockMutex(&gamepadLifecycleMutex);
+#endif
 
     // GFE will not send haptics events without this magic packet first
     sendEnableHaptics();
@@ -683,7 +815,14 @@ int startInputStream(void) {
 // Stops the input stream
 int stopInputStream(void) {
     // No more packets should be queued now
+#ifdef PLT_MUTEX_INITIALIZER
+    PltLockMutex(&gamepadLifecycleMutex);
+#endif
+    acceptingPhysicalGamepadEvents = false;
     initialized = false;
+#ifdef PLT_MUTEX_INITIALIZER
+    PltUnlockMutex(&gamepadLifecycleMutex);
+#endif
     LbqSignalQueueShutdown(&packetHolderFreeList);
 
     // Signal the input send thread to drain all pending
@@ -1000,11 +1139,16 @@ int LiSendUtf8TextEvent(const char *text, unsigned int length) {
 
 static int sendControllerEventInternal(short controllerNumber, short activeGamepadMask,
     int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
-    short leftStickX, short leftStickY, short rightStickX, short rightStickY)
+    short leftStickX, short leftStickY, short rightStickX, short rightStickY, uint64_t eventTimeUs)
 {
     PPACKET_HOLDER holder;
     int err;
     bool enqueueHolder = false;
+    bool snappyPhysical = snappyGamepadInput && eventTimeUs != 0;
+
+    if (controllerNumber < 0) {
+        return -1;
+    }
 
     if (!initialized) {
         return -2;
@@ -1054,8 +1198,11 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
 
         // If this new packet has different button flags, end the batch to ensure the
         // host receives the exact axis values present at the time of the button press.
-        if (holder->packet.multiController.buttonFlags != LE16((short)buttonFlags) ||
-            holder->packet.multiController.buttonFlags2 != (IS_SUNSHINE() ? LE16((short)(buttonFlags >> 16)) : 0)) {
+        bool buttonChange = holder->packet.multiController.buttonFlags != LE16((short)buttonFlags) ||
+            holder->packet.multiController.buttonFlags2 != (IS_SUNSHINE() ? LE16((short)(buttonFlags >> 16)) : 0);
+        if (buttonChange || (snappyPhysical &&
+            holder->packet.multiController.activeGamepadMask != LE16(activeGamepadMask))) {
+            if (buttonChange && eventTimeUs) gamepadDiagnostics.digitalEdges++;
             // Pretend there wasn't a currently queued controller packet
             holder = NULL;
         }
@@ -1065,10 +1212,11 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         // Because we're not using the currently queued packet, it's safe
         // to unlock here without having to worry about the input thread
         // touching our packet holder behind our back.
-        PltUnlockMutex(&batchedInputMutex);
+        if (!snappyPhysical) PltUnlockMutex(&batchedInputMutex);
 
         holder = allocatePacketHolder(0);
         if (holder == NULL) {
+            if (snappyPhysical) PltUnlockMutex(&batchedInputMutex);
             return -1;
         }
 
@@ -1084,7 +1232,7 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         // Reacquire the batched input mutex before making it visible to
         // the input thread by storing this in the input queue or in the
         // currentQueuedControllerPacket array.
-        PltLockMutex(&batchedInputMutex);
+        if (!snappyPhysical) PltLockMutex(&batchedInputMutex);
     }
 
     if (AppVersionQuad[0] == 3) {
@@ -1136,6 +1284,36 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         }
     }
 
+    if (eventTimeUs) {
+        if (!holder->gamepadFirstEventUs) {
+            holder->gamepadFirstEventUs = eventTimeUs;
+            gamepadDiagnostics.created++;
+            gamepadDiagnostics.pending++;
+            if (gamepadDiagnostics.pending > gamepadDiagnostics.highWater) {
+                gamepadDiagnostics.highWater = gamepadDiagnostics.pending;
+            }
+        }
+        if (!enqueueHolder) gamepadDiagnostics.coalesced++;
+        holder->gamepadLatestEventUs = eventTimeUs;
+        holder->gamepadQueuedUs = PltGetMicroseconds();
+        holder->snappyGamepad = snappyPhysical;
+    }
+
+    // Snappy publishes/enqueues atomically with respect to other producers and
+    // the consumer. Keep the successful OFF path's original unlock/wake ordering.
+    if (snappyPhysical && enqueueHolder) {
+        err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
+        if (err != LBQ_SUCCESS) {
+            if (currentQueuedControllerPacket[controllerNumber] == holder) {
+                currentQueuedControllerPacket[controllerNumber] = NULL;
+            }
+            gamepadDiagnostics.pending--;
+        }
+        PltUnlockMutex(&batchedInputMutex);
+        if (err != LBQ_SUCCESS) freePacketHolder(holder);
+        return err;
+    }
+
     // We can unlock the batched input mutex before enqueuing the new holder because
     // the input thread only cares if currentQueuedControllerPacket is equal to the
     // holder it's currently processing. Since it cannot be processing the holder
@@ -1151,8 +1329,15 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         // Enqueue the new packet holder
         err = LbqOfferQueueItem(&packetQueue, holder, &holder->entry);
         if (err != LBQ_SUCCESS) {
-            LC_ASSERT(err == LBQ_BOUND_EXCEEDED);
-            Limelog("Input queue reached maximum size limit\n");
+            LC_ASSERT(err == LBQ_BOUND_EXCEEDED || err == LBQ_INTERRUPTED);
+            // Clear the published pointer before recycling/freeing this holder.
+            PltLockMutex(&batchedInputMutex);
+            if (currentQueuedControllerPacket[controllerNumber] == holder) {
+                currentQueuedControllerPacket[controllerNumber] = NULL;
+            }
+            if (holder->gamepadFirstEventUs) gamepadDiagnostics.pending--;
+            PltUnlockMutex(&batchedInputMutex);
+            if (err == LBQ_BOUND_EXCEEDED) Limelog("Input queue reached maximum size limit\n");
             freePacketHolder(holder);
         }
     }
@@ -1169,7 +1354,7 @@ int LiSendControllerEvent(int buttonFlags, unsigned char leftTrigger, unsigned c
     short leftStickX, short leftStickY, short rightStickX, short rightStickY)
 {
     return sendControllerEventInternal(0, 0x1, buttonFlags, leftTrigger, rightTrigger,
-        leftStickX, leftStickY, rightStickX, rightStickY);
+        leftStickX, leftStickY, rightStickX, rightStickY, 0);
 }
 
 // Send a controller event to the streaming machine
@@ -1179,7 +1364,55 @@ int LiSendMultiControllerEvent(short controllerNumber, short activeGamepadMask,
 {
     return sendControllerEventInternal(controllerNumber, activeGamepadMask,
         buttonFlags, leftTrigger, rightTrigger,
-        leftStickX, leftStickY, rightStickX, rightStickY);
+        leftStickX, leftStickY, rightStickX, rightStickY, 0);
+}
+
+void LiSetSnappyGamepadInput(bool enabled) {
+#ifdef PLT_MUTEX_INITIALIZER
+    PltLockMutex(&gamepadLifecycleMutex);
+    // Configuration is a connection snapshot, never changed under a live worker.
+    if (!initialized) snappyGamepadInput = enabled;
+    PltUnlockMutex(&gamepadLifecycleMutex);
+#endif
+}
+
+uint64_t LiRecordGamepadCallback(void) {
+    uint64_t eventUs = PltGetMicroseconds();
+#ifdef PLT_MUTEX_INITIALIZER
+    PltLockMutex(&gamepadLifecycleMutex);
+    if (acceptingPhysicalGamepadEvents) {
+        PltLockMutex(&batchedInputMutex);
+        gamepadDiagnostics.callbacks++;
+        PltUnlockMutex(&batchedInputMutex);
+    }
+    else {
+        eventUs = 0;
+    }
+    PltUnlockMutex(&gamepadLifecycleMutex);
+#else
+    eventUs = 0;
+#endif
+    return eventUs;
+}
+
+int LiSendPhysicalGamepadEvent(short controllerNumber, short activeGamepadMask,
+    int buttonFlags, unsigned char leftTrigger, unsigned char rightTrigger,
+    short leftStickX, short leftStickY, short rightStickX, short rightStickY,
+    uint64_t eventTimeUs)
+{
+#ifdef PLT_MUTEX_INITIALIZER
+    PltLockMutex(&gamepadLifecycleMutex);
+    int err = -2;
+    if (acceptingPhysicalGamepadEvents) {
+        err = sendControllerEventInternal(controllerNumber, activeGamepadMask,
+            buttonFlags, leftTrigger, rightTrigger, leftStickX, leftStickY, rightStickX, rightStickY,
+            eventTimeUs ? eventTimeUs : PltGetMicroseconds());
+    }
+    PltUnlockMutex(&gamepadLifecycleMutex);
+    return err;
+#else
+    return -2;
+#endif
 }
 
 // Send a high resolution scroll event to the streaming machine
