@@ -1200,7 +1200,10 @@ static int sendControllerEventInternal(short controllerNumber, short activeGamep
         // host receives the exact axis values present at the time of the button press.
         bool buttonChange = holder->packet.multiController.buttonFlags != LE16((short)buttonFlags) ||
             holder->packet.multiController.buttonFlags2 != (IS_SUNSHINE() ? LE16((short)(buttonFlags >> 16)) : 0);
-        if (buttonChange || (snappyPhysical &&
+        // Physical diagnostics and send/shutdown policy belong to this source.
+        // Never let a virtual update inherit them (or attribute it to a gamepad).
+        bool sourceChange = (holder->gamepadFirstEventUs != 0) != (eventTimeUs != 0);
+        if (buttonChange || sourceChange || (snappyPhysical &&
             holder->packet.multiController.activeGamepadMask != LE16(activeGamepadMask))) {
             if (buttonChange && eventTimeUs) gamepadDiagnostics.digitalEdges++;
             // Pretend there wasn't a currently queued controller packet

@@ -233,6 +233,40 @@ static void unrelatedInputAndMetrics(bool snappy) {
     finish();
 }
 
+static void sharedSlotSources(bool snappy) {
+    begin(snappy);
+    CHECK(state(0, 1, A_FLAG, 10, 100) == 0);
+    PPACKET_HOLDER physical = currentQueuedControllerPacket[0];
+    uint64_t timestamp = physical->gamepadLatestEventUs;
+    CHECK(LiSendMultiControllerEvent(0, 1, A_FLAG, 20, 20, 200, 0, 0, 0) == 0);
+    PPACKET_HOLDER virtual = currentQueuedControllerPacket[0];
+    CHECK(physical != virtual && LbqGetItemCount(&packetQueue) == 2);
+    CHECK(physical->gamepadLatestEventUs == timestamp && physical->snappyGamepad == snappy);
+    CHECK(!virtual->snappyGamepad && !virtual->gamepadFirstEventUs && !virtual->gamepadLatestEventUs);
+    CHECK(LiSendMultiControllerEvent(0, 1, A_FLAG, 30, 30, 300, 0, 0, 0) == 0);
+    CHECK(currentQueuedControllerPacket[0] == virtual); // Same-source analog still batches.
+    CHECK(state(0, 1, A_FLAG, 40, 400) == 0); // Reverse source transition also splits.
+    CHECK(currentQueuedControllerPacket[0] != virtual && LbqGetItemCount(&packetQueue) == 3);
+    CHECK(gamepadDiagnostics.created == 2 && gamepadDiagnostics.coalesced == 0);
+    runWorker();
+    CHECK(sentCount == 3 && gamepadDiagnostics.sent == 2);
+    CHECK(LE16(sent[0].packet.leftStickX) == 100 && LE16(sent[1].packet.leftStickX) == 300);
+    CHECK(sent[0].moreData == !snappy && sent[1].moreData && !sent[2].moreData);
+    finish();
+
+    begin(snappy);
+    CHECK(state(0, 1, 0, 0, 100) == 0);
+    CHECK(LiSendMultiControllerEvent(0, 1, 0, 0, 0, 200, 0, 0, 0) == 0);
+    PltLockMutex(&gamepadLifecycleMutex);
+    acceptingPhysicalGamepadEvents = initialized = false;
+    PltUnlockMutex(&gamepadLifecycleMutex);
+    CHECK(PltCreateThread("InputSend", inputSendThreadProc, NULL, &inputSendThread) == 0);
+    CHECK(stopInputStream() == 0);
+    CHECK(sentCount == (snappy ? 1 : 2));
+    CHECK(LE16(sent[sentCount - 1].packet.leftStickX) == 200); // Virtual input survives stock drain.
+    destroyInputStream();
+}
+
 static void liveWorker(bool snappy) {
     begin(snappy);
     CHECK(PltCreateThread("InputSend", inputSendThreadProc, NULL, &inputSendThread) == 0);
@@ -258,7 +292,7 @@ int main(void) {
     for (unsigned mode = 0; mode < 2; mode++) {
         analogAndClaim(mode); edges(mode); slotsAndDisconnect(mode);
         enqueueFailure(mode); shutdownAndReconnect(mode);
-        unrelatedInputAndMetrics(mode); liveWorker(mode);
+        unrelatedInputAndMetrics(mode); sharedSlotSources(mode); liveWorker(mode);
     }
     puts("PASS: gamepad coalescing, claim races, digital edges, slots, queue failures, teardown, OFF hints, metrics, live worker");
     return 0;
